@@ -836,7 +836,7 @@ def compute_shapley_alpha(vectors, low_rank_vectors, l2_norms):
     # 3. Softmax Normalization with Temperature
     # Temperature < 1 makes the distribution sharper (highlights top experts)
     # Temperature > 1 makes it flatter
-    temperature = 1.5 
+    temperature = 1.2 
     alpha = torch.softmax(shapley_values / temperature, dim=0)
         
     return alpha
@@ -1052,7 +1052,7 @@ def wudi_nash_merging_trick2(
             u2, s2, v2 = torch.linalg.svd(vector, full_matrices=False)
             
             # Keep slightly more rank info for better accuracy
-            reduced_index_s = max(1, int(s.shape[0] * 0.2)) # Keep top 20%
+            reduced_index_s = max(1, int(s.shape[0] * 0.1)) # Keep top 20%
             
             u2 = u2[:, :reduced_index_s]
             s2 = s2[:reduced_index_s]
@@ -1572,7 +1572,7 @@ def wudi_nash_merging(merged_model: nn.Module, models_to_merge: list, exclude_pa
         for model_to_merge in models_to_merge
     ]
     
-    def get_nash_shapley_optimized_task_vector(param_name, vectors, iter_num=200): # Iterations reduced due to better optimizer
+    def get_nash_shapley_optimized_task_vector(param_name, vectors, iter_num=150): # Iterations reduced due to better optimizer
         original_dtype = vectors.dtype
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         vectors = vectors.to(torch.float32).to(device)
@@ -1631,11 +1631,11 @@ def wudi_nash_merging(merged_model: nn.Module, models_to_merge: list, exclude_pa
         merging_vector = torch.nn.Parameter(shapley_centroid.clone())
         
         # Upgrade to Adam Optimizer
-        optimizer = torch.optim.Adam([merging_vector], lr=1e-3)
+        optimizer = torch.optim.Adam([merging_vector], lr=2e-3)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iter_num)
         
         # Regularization Strength
-        lambda_reg = 0.01 
+        lambda_reg = 0.05 
         
         # [Step 3] Optimization Loop
         for i in range(iter_num): # Removed tqdm for speed in inner loops
@@ -1681,7 +1681,7 @@ def wudi_nash_merging(merged_model: nn.Module, models_to_merge: list, exclude_pa
                 for task_vector in models_to_merge_task_vectors
             ])
             
-            merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=100)
+            merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=150)
             merged_task_vector_dict[param_name] = merging_vector
     
     # Handle others with Shapley-Weighted Average (Better than simple average)
@@ -2277,17 +2277,95 @@ def svt_operator(matrix: torch.Tensor, mu: float) -> torch.Tensor:
     return (u @ torch.diag_embed(s_thresh) @ vh).to(matrix.dtype)
 
 # ====================== 方法二完整合并函数 ======================
-def wudi_nash_merging_lore(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
+def wudi_nash_merging_lore(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0, mu: float = 0.01, max_iter: int = 30, nash_iter_num: int = 150):
     """完整 LoRE 版（先低秩精炼 task vectors，再走你原来的 Shapley + Nash）"""
     models_to_merge_task_vectors = [
         TaskVector(pretrained_model=merged_model, finetuned_model=model_to_merge, exclude_param_names_regex=exclude_param_names_regex)
         for model_to_merge in models_to_merge
     ]
+
+    # Use the optimized Nash-Shapley merging function (Internal definition to ensure availability)
+    def get_nash_shapley_optimized_task_vector(param_name, vectors, iter_num=nash_iter_num):
+        original_dtype = vectors.dtype
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        vectors = vectors.to(torch.float32).to(device)
+        
+        # [Pre-computation] SVD and Low Rank
+        low_rank_list = []
+        taskvector_list = []
+        
+        for i in range(vectors.shape[0]):
+            vector = vectors[i]
+            u, s, v = torch.linalg.svd(vector, full_matrices=True)
+            u2, s2, v2 = torch.linalg.svd(vector, full_matrices=False)
+            
+            # Keep slightly more rank info for better accuracy
+            reduced_index_s = max(1, int(s.shape[0] * 0.2)) # Keep top 20% instead of 1/N
+            
+            u2 = u2[:, :reduced_index_s]
+            s2 = s2[:reduced_index_s]
+            v2 = v2[:reduced_index_s, :]
+            
+            s_mask = torch.zeros_like(s)
+            s_mask[:reduced_index_s] = 1
+            s = s * s_mask
+            
+            v_mask = torch.zeros_like(v)
+            v_mask[:reduced_index_s, :] = 1
+            v = v * v_mask 
+            
+            S_matrix = torch.zeros(vector.shape[0], vector.shape[1], device=s.device) 
+            min_dim = min(vector.shape)
+            S_matrix[:min_dim, :min_dim] = torch.diag_embed(s)
+            
+            low_rank_list.append(S_matrix @ v)
+            taskvector_list.append(u2 @ torch.diag_embed(s2) @ v2)
+
+        low_rank = torch.stack(low_rank_list)
+        taskvector = torch.stack(taskvector_list)
+        l2_norms = torch.square(torch.norm(vectors.reshape(vectors.shape[0], -1), p=2, dim=-1)) + 1e-6
+
+        # [Step 1] Compute Shapley Alphas
+        with torch.no_grad():
+            nash_alpha = compute_shapley_alpha(vectors, low_rank, l2_norms)
+            shapley_centroid = torch.sum(vectors * nash_alpha.view(-1, 1, 1), dim=0)
+            vector_norms = torch.norm(vectors.reshape(vectors.shape[0], -1), p=2, dim=1)
+            target_norm = torch.sum(vector_norms * nash_alpha)
+
+        # [Step 2] Optimization Setup
+        merging_vector = torch.nn.Parameter(shapley_centroid.clone())
+        optimizer = torch.optim.Adam([merging_vector], lr=2e-3)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iter_num)
+        lambda_reg = 0.05 
+        
+        # [Step 3] Optimization Loop
+        for i in range(iter_num): 
+            disturbing_vectors = merging_vector.unsqueeze(0) - taskvector
+            inner_product = torch.matmul(disturbing_vectors, low_rank.transpose(1, 2))
+            
+            per_task_loss = torch.sum(torch.square(inner_product), dim=(1, 2)) / l2_norms
+            nash_loss = torch.sum(nash_alpha * per_task_loss)
+            reg_loss = torch.norm(merging_vector - shapley_centroid)
+            
+            total_loss = nash_loss + lambda_reg * reg_loss
+                
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+        # [Step 4] Post-Optimization Norm Rectification
+        optimized_norm = torch.norm(merging_vector)
+        if optimized_norm > 1e-6:
+            scaling_factor = target_norm / optimized_norm
+            final_vector = merging_vector * scaling_factor
+        else:
+            final_vector = merging_vector
+            
+        return final_vector.data.detach().to(original_dtype).cpu()
     
     # ================== LoRE 预处理（论文 Algorithm 1） ==================
-    print("Running LoRE preprocessing (μ=0.01, 30 iter)...")
-    mu = 0.01                                      # 论文推荐最佳值
-    max_iter = 30
+    print(f"Running LoRE preprocessing (μ={mu}, {max_iter} iter)...")
     refined_deltas = {}                            # param_name -> list[low-rank δ_i]
     
     for param_name in tqdm(list(models_to_merge_task_vectors[0].task_vector_param_dict.keys()), desc="LoRE Preprocess"):
@@ -2317,7 +2395,7 @@ def wudi_nash_merging_lore(merged_model: nn.Module, models_to_merge: list, exclu
             values = torch.stack([task_vector.task_vector_param_dict[param_name] for task_vector in models_to_merge_task_vectors])
         
         # 继续走你原来的 Nash 优化（完全保留）
-        merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=100)  # 你原来的函数
+        merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=nash_iter_num)  # 使用优化后的参数
         merged_task_vector_dict[param_name] = merging_vector
 
     # 非2D层处理（同原代码）
@@ -2850,14 +2928,14 @@ def merge_models(merge_method="wudi2", scaling_coefficient = 0.1):
     base_model.load_state_dict(base_state_dict)
     base_model = base_model.cuda()
     
-    # base_dir = os.path.dirname(os.path.abspath(__file__))
-    # output_path = os.path.join(base_dir, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    output_path = os.path.join(base_dir, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
     
     # Save to data disk to avoid filling up system disk
-    save_root = '/root/autodl-tmp/merged_models'
-    if not os.path.exists(save_root):
-        os.makedirs(save_root, exist_ok=True)
-    output_path = os.path.join(save_root, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
+    # save_root = '/root/autodl-tmp/merged_models'
+    # if not os.path.exists(save_root):
+    #     os.makedirs(save_root, exist_ok=True)
+    # output_path = os.path.join(save_root, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
     print(f"Saving model to {output_path}")
     base_model.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
@@ -2880,13 +2958,13 @@ if __name__ == "__main__":
     path_f = 'yongxianwei/InternVL2_5-1B_Grounding'
 
     print("Loading base model and experts...")
-    global tokenizer, models
-    tokenizer = AutoTokenizer.from_pretrained(path_a, trust_remote_code=True, use_fast=False)
-    
     # Load all models once
     # Keep base_model_original on CPU to be safe and clean for deepcopy
     base_model_original = AutoModel.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True).eval()
     
+    # Use the tokenizer from the base model path
+    tokenizer = AutoTokenizer.from_pretrained(path_a, trust_remote_code=True, use_fast=False)
+
     models = {
         'b': AutoModel.from_pretrained(path_b, torch_dtype=torch.float16, trust_remote_code=True).eval(),
         'c': AutoModel.from_pretrained(path_c, torch_dtype=torch.float16, trust_remote_code=True).eval(),
@@ -2898,7 +2976,7 @@ if __name__ == "__main__":
     # Hyperparameters to search
     merge_method = 'wudi_nash' 
     # scaling_coefficients = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
-    scaling_coefficients = [0.1]
+    scaling_coefficients = [0.7]
     
     print(f"Starting merge with method '{merge_method}' and coefficients: {scaling_coefficients}")
     

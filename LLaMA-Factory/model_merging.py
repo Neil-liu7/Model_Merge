@@ -2347,6 +2347,7 @@ if __name__ == "__main__":
     # scaling_coefficients = [0.1,0.3, 0.5, 0.7, 0.9, 1.5]
     scaling_coefficients = [1.1,1.2,1.3,1.4]
 
+    merge_method = "wudi_core_nash"
     for coeff in scaling_coefficients:
         print(f"\n=======================================================")
         print(f"Running experiment with scaling_coefficient={coeff}")
@@ -2355,10 +2356,11 @@ if __name__ == "__main__":
         # Reset base model to original state
         models['a'].load_state_dict(original_base_state_dict)
         
-        output_dir = f'merged_model_only_core_coeff_{coeff}'
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        output_dir = os.path.join(base_dir, f'merged_model_{merge_method}_coeff_{coeff}')
         
         # Call merging
-        model = merge_models(merge_method="wudi_core_nash", scaling_coefficient=coeff, output_path=output_dir)
+        model = merge_models(merge_method=merge_method, scaling_coefficient=coeff, output_path=output_dir)
 
         #####################################################################
         # Set example image paths
