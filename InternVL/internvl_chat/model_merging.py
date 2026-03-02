@@ -836,7 +836,7 @@ def compute_shapley_alpha(vectors, low_rank_vectors, l2_norms):
     # 3. Softmax Normalization with Temperature
     # Temperature < 1 makes the distribution sharper (highlights top experts)
     # Temperature > 1 makes it flatter
-    temperature = 0.5 
+    temperature = 1.5 
     alpha = torch.softmax(shapley_values / temperature, dim=0)
         
     return alpha
@@ -2183,7 +2183,157 @@ def shapfed_nash_merging(merged_model: nn.Module, models_to_merge: list, exclude
     
     return merged_params
 
+# ====================== 方法一核心：TSV-Procrustes（替换 GD Nash） ======================
+def get_tsv_shapley_optimized_task_vector(param_name, vectors):
+    """TSV-Merge (arXiv:2412.00081 Algorithm 1) + Shapley 加权 Σ"""
+    original_dtype = vectors.dtype
+    device = vectors.device
+    n_models = vectors.shape[0]
+    vectors = vectors.to(torch.float32).to(device)
 
+    # 1. 计算 Shapley alpha（保留你的公平性）
+    low_rank_list = []
+    l2_norms = torch.square(torch.norm(vectors.reshape(n_models, -1), p=2, dim=-1)) + 1e-6
+    for i in range(n_models):
+        u, s, vh = torch.linalg.svd(vectors[i], full_matrices=False)
+        k_temp = max(1, s.shape[0] // n_models)
+        low_rank_list.append(u[:, :k_temp] @ torch.diag_embed(s[:k_temp]) @ vh[:k_temp, :])
+    low_rank = torch.stack(low_rank_list)
+    with torch.no_grad():
+        nash_alpha = compute_shapley_alpha(vectors, low_rank, l2_norms)
+
+    # 2. per-task SVD + 截断 k=1/T（论文精确设定）
+    U_list, Sigma_list, V_list = [], [], []  # V_list 保存 paper 中的 V (n x k)
+    for i in range(n_models):
+        u, s, vh = torch.linalg.svd(vectors[i], full_matrices=False)
+        k = max(1, s.shape[0] // n_models)          # 论文明确：k = 1/T
+        U_list.append(u[:, :k])
+        Sigma_list.append(s[:k] * nash_alpha[i])    # Shapley 加权（我们的增强）
+        V_i = vh[:k, :].T                           # 转为 paper 的 V (n x k)
+        V_list.append(V_i)
+
+    # 3. 拼接
+    U_cat = torch.cat(U_list, dim=1)                # (out_dim, T*k)
+    V_cat = torch.cat(V_list, dim=1)                # (in_dim, T*k)
+    Sigma_block = torch.block_diag(*[torch.diag(s) for s in Sigma_list])
+
+    # 4. Procrustes 正交化（论文核心 whitening）
+    # U⊥
+    Pu, _, Vhu = torch.linalg.svd(U_cat, full_matrices=False)
+    U_perp = Pu @ Vhu
+    # V⊥
+    Pv, _, Vhv = torch.linalg.svd(V_cat, full_matrices=False)
+    V_perp = Pv @ Vhv
+
+    # 5. 重构 merged_vector
+    merging_vector = U_perp @ Sigma_block @ V_perp.T
+
+    # 6. Norm 矫正（保留你的能量）
+    target_norm = torch.sum(torch.norm(vectors.reshape(n_models, -1), p=2, dim=1) * nash_alpha)
+    optimized_norm = torch.norm(merging_vector)
+    if optimized_norm > 1e-6:
+        merging_vector = merging_vector * (target_norm / optimized_norm)
+
+    return merging_vector.data.detach().to(original_dtype).cpu()
+
+# ====================== 方法一完整合并函数 ======================
+def wudi_nash_merging_tsv(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
+    """完整 TSV 版（推荐优先实验，速度快、无梯度）"""
+    models_to_merge_task_vectors = [
+        TaskVector(pretrained_model=merged_model, finetuned_model=model_to_merge, exclude_param_names_regex=exclude_param_names_regex)
+        for model_to_merge in models_to_merge
+    ]
+    
+    merged_task_vector_dict = {}
+    for param_name in tqdm(models_to_merge_task_vectors[0].task_vector_param_dict, desc="TSV Optimizing Layers"):
+        param_data = models_to_merge_task_vectors[0].task_vector_param_dict[param_name]
+        
+        if len(param_data.shape) == 2 and "lm_head" not in param_name:
+            values = torch.stack([
+                task_vector.task_vector_param_dict[param_name] 
+                for task_vector in models_to_merge_task_vectors
+            ])
+            merging_vector = get_tsv_shapley_optimized_task_vector(param_name, values)
+            merged_task_vector_dict[param_name] = merging_vector
+        else:
+            # 非2D层用简单平均
+            merged_param = models_to_merge_task_vectors[0].task_vector_param_dict[param_name].clone()
+            for i, task_vector in enumerate(models_to_merge_task_vectors[1:], 1):
+                merged_param += (task_vector.task_vector_param_dict[param_name] - merged_param) / (i + 1)
+            merged_task_vector_dict[param_name] = merged_param
+
+    merged_task_vector = TaskVector(task_vector_param_dict=merged_task_vector_dict)
+    merged_params = merged_task_vector.combine_with_pretrained_model(
+        pretrained_model=merged_model,
+        scaling_coefficient=scaling_coefficient
+    )
+    return merged_params
+
+# ====================== 方法二核心：LoRE 预处理 ======================
+def svt_operator(matrix: torch.Tensor, mu: float) -> torch.Tensor:
+    """Singular Value Thresholding (LoRE 论文精确实现)"""
+    u, s, vh = torch.linalg.svd(matrix.to(torch.float32), full_matrices=False)
+    s_thresh = torch.clamp(s - mu, min=0.0)
+    return (u @ torch.diag_embed(s_thresh) @ vh).to(matrix.dtype)
+
+# ====================== 方法二完整合并函数 ======================
+def wudi_nash_merging_lore(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
+    """完整 LoRE 版（先低秩精炼 task vectors，再走你原来的 Shapley + Nash）"""
+    models_to_merge_task_vectors = [
+        TaskVector(pretrained_model=merged_model, finetuned_model=model_to_merge, exclude_param_names_regex=exclude_param_names_regex)
+        for model_to_merge in models_to_merge
+    ]
+    
+    # ================== LoRE 预处理（论文 Algorithm 1） ==================
+    print("Running LoRE preprocessing (μ=0.01, 30 iter)...")
+    mu = 0.01                                      # 论文推荐最佳值
+    max_iter = 30
+    refined_deltas = {}                            # param_name -> list[low-rank δ_i]
+    
+    for param_name in tqdm(list(models_to_merge_task_vectors[0].task_vector_param_dict.keys()), desc="LoRE Preprocess"):
+        if len(models_to_merge_task_vectors[0].task_vector_param_dict[param_name].shape) != 2:
+            continue
+        theta_list = [tv.task_vector_param_dict[param_name] for tv in models_to_merge_task_vectors]
+        n_models = len(theta_list)
+        deltas = [torch.zeros_like(theta_list[0]) for _ in range(n_models)]
+        
+        for _ in range(max_iter):
+            theta0 = torch.mean(torch.stack([theta_list[i] - deltas[i] for i in range(n_models)]), dim=0)
+            for i in range(n_models):
+                deltas[i] = svt_operator(theta_list[i] - theta0, mu)
+        
+        refined_deltas[param_name] = deltas
+    # =================================================================
+
+    merged_task_vector_dict = {}
+    for param_name in tqdm(models_to_merge_task_vectors[0].task_vector_param_dict, desc="Nash Optimizing Layers"):
+        param_data = models_to_merge_task_vectors[0].task_vector_param_dict[param_name]
+        
+        if param_name in refined_deltas and len(param_data.shape) == 2 and "lm_head" not in param_name:
+            # 使用 LoRE 精炼后的低秩 δ_i
+            values = torch.stack(refined_deltas[param_name])
+        else:
+            # 其他层用原始
+            values = torch.stack([task_vector.task_vector_param_dict[param_name] for task_vector in models_to_merge_task_vectors])
+        
+        # 继续走你原来的 Nash 优化（完全保留）
+        merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=100)  # 你原来的函数
+        merged_task_vector_dict[param_name] = merging_vector
+
+    # 非2D层处理（同原代码）
+    for param_name in models_to_merge_task_vectors[0].task_vector_param_dict.keys():
+        if param_name not in merged_task_vector_dict:
+            merged_param = models_to_merge_task_vectors[0].task_vector_param_dict[param_name].clone()
+            for i, task_vector in enumerate(models_to_merge_task_vectors[1:], 1):
+                merged_param += (task_vector.task_vector_param_dict[param_name] - merged_param) / (i + 1)
+            merged_task_vector_dict[param_name] = merged_param
+
+    merged_task_vector = TaskVector(task_vector_param_dict=merged_task_vector_dict)
+    merged_params = merged_task_vector.combine_with_pretrained_model(
+        pretrained_model=merged_model,
+        scaling_coefficient=scaling_coefficient
+    )
+    return merged_params
 def wudi_core_nash_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0, 
                            lora_rank: int = 16, lr: float = 1e-3, max_iters: int = 300, early_stop_tol: float = 1e-6):
     """
@@ -2675,6 +2825,22 @@ def merge_models(merge_method="wudi2", scaling_coefficient = 0.1):
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient
         )
+    elif merge_method == "wudi_nash_merging_tsv":
+        print("Running wudi_nash_merging_tsv...")
+        merged_params = wudi_nash_merging_tsv(
+            merged_model=base_model,
+            models_to_merge=models_to_merge,
+            exclude_param_names_regex=exclude_param_names_regex,
+            scaling_coefficient=scaling_coefficient
+        )
+    elif merge_method == "wudi_nash_merging_lore":
+        print("Running wudi_nash_merging_lore...")
+        merged_params = wudi_nash_merging_lore(
+            merged_model=base_model,
+            models_to_merge=models_to_merge,
+            exclude_param_names_regex=exclude_param_names_regex,
+            scaling_coefficient=scaling_coefficient
+        )
     else:
         raise ValueError(f"Unknown merge_method: {merge_method}")
     
@@ -2684,8 +2850,14 @@ def merge_models(merge_method="wudi2", scaling_coefficient = 0.1):
     base_model.load_state_dict(base_state_dict)
     base_model = base_model.cuda()
     
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(base_dir, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
+    # base_dir = os.path.dirname(os.path.abspath(__file__))
+    # output_path = os.path.join(base_dir, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
+    
+    # Save to data disk to avoid filling up system disk
+    save_root = '/root/autodl-tmp/merged_models'
+    if not os.path.exists(save_root):
+        os.makedirs(save_root, exist_ok=True)
+    output_path = os.path.join(save_root, f"merged_model_{merge_method}_coeff_{scaling_coefficient}")
     print(f"Saving model to {output_path}")
     base_model.save_pretrained(output_path)
     tokenizer.save_pretrained(output_path)
@@ -2724,8 +2896,9 @@ if __name__ == "__main__":
     }
     
     # Hyperparameters to search
-    merge_method = 'wudi_only_core' 
-    scaling_coefficients = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
+    merge_method = 'wudi_nash' 
+    # scaling_coefficients = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
+    scaling_coefficients = [0.1]
     
     print(f"Starting merge with method '{merge_method}' and coefficients: {scaling_coefficients}")
     
