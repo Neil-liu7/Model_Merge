@@ -2717,7 +2717,8 @@ def compute_acute_shapley_alpha(vectors: torch.Tensor, low_rank: torch.Tensor, l
     在锐角正锥投影空间中计算 Shapley 值（Acute Cone 版本）
     与原版逻辑完全一致，但明确用于 acute cone 空间
     """
-    interference = torch.sum(torch.square(torch.matmul(vectors, low_rank.transpose(1, 2))), dim=(1, 2)) / l2_norms
+    G = torch.matmul(vectors, vectors.transpose(0, 1))
+    interference = torch.sum(torch.square(G), dim=1) / (l2_norms + 1e-12)
     alpha = 1 / (interference + 1e-6)
     alpha = alpha / alpha.sum()
     return alpha
@@ -3201,12 +3202,12 @@ if __name__ == "__main__":
     import copy
     
     # Configuration
-    path_a = 'OpenGVLab/InternVL2_5-1B'
-    path_b = 'yongxianwei/InternVL2_5-1B_OCR'
-    path_c = 'yongxianwei/InternVL2_5-1B_VQA'
-    path_d = 'yongxianwei/InternVL2_5-1B_Geometry'
-    path_e = 'yongxianwei/InternVL2_5-1B_Chart'
-    path_f = 'yongxianwei/InternVL2_5-1B_Grounding'
+    path_a = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B'
+    path_b = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-OCR/checkpoint-3155'
+    path_c = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-Vqa/checkpoint-2475'
+    path_d = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-geo/checkpoint-1975'
+    path_e = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-chart/checkpoint-3355'
+    path_f = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-Grounding/checkpoint-3660'
 
     print("Loading base model and experts...")
     # Load all models once
@@ -3225,7 +3226,7 @@ if __name__ == "__main__":
     }
     
     # Hyperparameters to search
-    merge_method = 'wudi_acute_nash' 
+    merge_method = 'wudi_nash_merging_lore' 
     # scaling_coefficients = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
     scaling_coefficients = [0.7]
     
