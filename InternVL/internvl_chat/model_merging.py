@@ -381,6 +381,37 @@ def task_arithmetic(merged_model: nn.Module, models_to_merge: list, exclude_para
 
         return merged_params
 
+def weight_average_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
+    """
+    weight average merging method
+    :param merged_model: nn.Module, the merged model
+    :param models_to_merge: list, individual models that need to be merged
+    :param exclude_param_names_regex: list, regular expression of names of parameters that need to be excluded
+    :param scaling_coefficient: float, scaling coefficient to merge the task vectors
+    :return:
+    """
+    assert isinstance(scaling_coefficient, float), "wrong type of scaling_coefficient, should be float!"
+
+    models_to_merge_task_vectors = [TaskVector(pretrained_model=merged_model, finetuned_model=model_to_merge, exclude_param_names_regex=exclude_param_names_regex) for model_to_merge in models_to_merge]
+    
+    num_models = len(models_to_merge)
+
+    # iterate each individual model that needs to be merged
+    with torch.no_grad():
+        # sum up the task vectors
+        merged_task_vector = models_to_merge_task_vectors[0]
+        for index in range(1, num_models):
+            merged_task_vector = merged_task_vector + models_to_merge_task_vectors[index]
+        
+        # Average the task vectors
+        for param_name in merged_task_vector.task_vector_param_dict:
+            merged_task_vector.task_vector_param_dict[param_name] /= num_models
+
+        # combine with parameters of the merged model based on scaling coefficient
+        merged_params = merged_task_vector.combine_with_pretrained_model(pretrained_model=merged_model, scaling_coefficient=scaling_coefficient)
+
+    return merged_params
+
 def svd_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
     """
     SVD merging method that uses Singular Value Decomposition to merge models.
@@ -2390,13 +2421,12 @@ def wudi_nash_merging_lore(merged_model: nn.Module, models_to_merge: list, exclu
         if param_name in refined_deltas and len(param_data.shape) == 2 and "lm_head" not in param_name:
             # 使用 LoRE 精炼后的低秩 δ_i
             values = torch.stack(refined_deltas[param_name])
+            # 继续走你原来的 Nash 优化（完全保留）
+            merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=nash_iter_num)  # 使用优化后的参数
+            merged_task_vector_dict[param_name] = merging_vector
         else:
-            # 其他层用原始
-            values = torch.stack([task_vector.task_vector_param_dict[param_name] for task_vector in models_to_merge_task_vectors])
-        
-        # 继续走你原来的 Nash 优化（完全保留）
-        merging_vector = get_nash_shapley_optimized_task_vector(param_name, values, iter_num=nash_iter_num)  # 使用优化后的参数
-        merged_task_vector_dict[param_name] = merging_vector
+            # 其他层用原始，且不进行 Nash 优化，直接走下面的平均
+            pass
 
     # 非2D层处理（同原代码）
     for param_name in models_to_merge_task_vectors[0].task_vector_param_dict.keys():
@@ -2973,6 +3003,14 @@ def merge_models(merge_method="wudi2", scaling_coefficient = 0.1):
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient
         )
+    elif merge_method == "weight_average":
+        print("Running weight_average_merging...")
+        merged_params = weight_average_merging(
+            merged_model=base_model,
+            models_to_merge=models_to_merge,
+            exclude_param_names_regex=exclude_param_names_regex,
+            scaling_coefficient=scaling_coefficient
+        )
     elif merge_method == "ties":
         print("Running ties_merging...")
         merged_params = ties_merging(
@@ -3202,18 +3240,18 @@ if __name__ == "__main__":
     import copy
     
     # Configuration
-    path_a = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B'
-    path_b = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-OCR/checkpoint-3155'
-    path_c = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-Vqa/checkpoint-2475'
-    path_d = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-geo/checkpoint-1975'
-    path_e = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-chart/checkpoint-3355'
-    path_f = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-Grounding/checkpoint-3660'
+    path_a = '/root/Model_Merge/InternVL3.5-2B-Series/InternVL3_5-2B'
+    path_b = '/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_lora_expert_chart'
+    path_c = '/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_lora_expert_counting'
+    path_d = '/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_lora_expert_general'
+    path_e = '/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_lora_expert_ocr'
+    # path_f = '/root/Model_Merge/InternVL3-1B-Series/InternVL3-1B-Grounding/checkpoint-3660'
 
     print("Loading base model and experts...")
     # Load all models once
     # Keep base_model_original on CPU to be safe and clean for deepcopy
-    base_model_original = AutoModel.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True).eval()
-    
+    # base_model_original = AutoModel.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True).eval()
+    base_model_original = AutoModel.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=False).eval()
     # Use the tokenizer from the base model path
     tokenizer = AutoTokenizer.from_pretrained(path_a, trust_remote_code=True, use_fast=False)
 
@@ -3222,35 +3260,37 @@ if __name__ == "__main__":
         'c': AutoModel.from_pretrained(path_c, torch_dtype=torch.float16, trust_remote_code=True).eval(),
         'd': AutoModel.from_pretrained(path_d, torch_dtype=torch.float16, trust_remote_code=True).eval(),
         'e': AutoModel.from_pretrained(path_e, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'f': AutoModel.from_pretrained(path_f, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        # 'f': AutoModel.from_pretrained(path_f, torch_dtype=torch.float16, trust_remote_code=True).eval(),
     }
     
     # Hyperparameters to search
-    merge_method = 'wudi_nash_merging_lore' 
+    # merge_methods = ['wudi_nash_merging_lore','ties','weight_average','dare ta','iso','wudi','wudi2'] 
+    merge_methods = ['wudi_nash_merging_lore']
     # scaling_coefficients = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
     scaling_coefficients = [0.7]
     
-    print(f"Starting merge with method '{merge_method}' and coefficients: {scaling_coefficients}")
+    print(f"Starting merge with methods '{merge_methods}' and coefficients: {scaling_coefficients}")
     
     for scaling_coefficient in scaling_coefficients:
-        print(f"\nProcessing scaling_coefficient: {scaling_coefficient}")
-        
-        # Prepare clean base model for this iteration
-        # Deepcopy to avoid in-place modification affecting next runs
-        # We put it into global 'models' dict as 'a' because merge_models expects it there
-        models['a'] = copy.deepcopy(base_model_original)
-        
-        try:
-            merge_models(merge_method=merge_method, scaling_coefficient=scaling_coefficient)
-        except Exception as e:
-            print(f"Error executing with coefficient {scaling_coefficient}: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        # Clean up to save memory
-        if 'a' in models:
-            del models['a']
-        torch.cuda.empty_cache()
+        for merge_method in merge_methods:
+            print(f"\nProcessing scaling_coefficient: {scaling_coefficient}, merge_method: {merge_method}")
+            
+            # Prepare clean base model for this iteration
+            # Deepcopy to avoid in-place modification affecting next runs
+            # We put it into global 'models' dict as 'a' because merge_models expects it there
+            models['a'] = copy.deepcopy(base_model_original)
+            
+            try:
+                merge_models(merge_method=merge_method, scaling_coefficient=scaling_coefficient)
+            except Exception as e:
+                print(f"Error executing with coefficient {scaling_coefficient} and method {merge_method}: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Clean up to save memory
+            if 'a' in models:
+                del models['a']
+            torch.cuda.empty_cache()
 # set the max number of tiles in `max_num`
 # pixel_values = load_image('./examples/image1.jpg', max_num=12).to(torch.float16).cuda()
 # generation_config = dict(max_new_tokens=1024, do_sample=False)

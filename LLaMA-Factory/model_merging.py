@@ -11,13 +11,17 @@ import re
 import math
 import itertools
 import concurrent.futures
+import os
 
 try:
     from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 except ImportError:
     from transformers import AutoTokenizer, AutoProcessor
     Qwen2VLForConditionalGeneration = None
-from qwen_vl_utils import process_vision_info
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    process_vision_info = None
 
 def get_param_names_to_merge(input_param_names: list, exclude_param_names_regex: list):
     param_names_to_merge = []
@@ -106,7 +110,7 @@ def ties_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_n
     for model_to_merge in models_to_merge:
         task_vector_dict = {}
         for param_name in param_names_to_merge:
-            task_vector_dict[param_name] = model_to_merge.state_dict()[param_name] - merged_model.state_dict()[param_name]
+            task_vector_dict[param_name] = model_to_merge.state_dict()[param_name].to("cpu") - merged_model.state_dict()[param_name].to("cpu")
         models_to_merge_task_vectors.append(task_vector_dict)
     
     merged_params = {}
@@ -171,6 +175,25 @@ def mask_model_weights(finetuned_model: nn.Module, pretrained_model: nn.Module, 
 
     return masked_param_dict
 
+def weight_average_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
+    assert isinstance(scaling_coefficient, float), "wrong type of scaling_coefficient, should be float!"
+    if len(models_to_merge) == 0:
+        return {}
+    models_to_merge_task_vectors = [
+        TaskVector(pretrained_model=merged_model, finetuned_model=model_to_merge, exclude_param_names_regex=exclude_param_names_regex)
+        for model_to_merge in models_to_merge
+    ]
+    num_models = len(models_to_merge_task_vectors)
+    with torch.no_grad():
+        merged_task_vector = models_to_merge_task_vectors[0]
+        for index in range(1, num_models):
+            merged_task_vector = merged_task_vector + models_to_merge_task_vectors[index]
+        for param_name in merged_task_vector.task_vector_param_dict:
+            merged_task_vector.task_vector_param_dict[param_name] = merged_task_vector.task_vector_param_dict[param_name] / float(num_models)
+        merged_params = merged_task_vector.combine_with_pretrained_model(pretrained_model=merged_model, scaling_coefficient=scaling_coefficient)
+    return merged_params
+
+
 def task_arithmetic(merged_model: nn.Module, models_to_merge: list, exclude_param_names_regex: list, scaling_coefficient: float = 1.0):
     assert isinstance(scaling_coefficient, float), "wrong type of scaling_coefficient, should be float!"
 
@@ -198,7 +221,7 @@ def svd_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_na
     for model_to_merge in models_to_merge:
         task_vector_dict = {}
         for param_name in param_names_to_merge:
-            task_vector_dict[param_name] = model_to_merge.state_dict()[param_name] - merged_model.state_dict()[param_name]
+            task_vector_dict[param_name] = model_to_merge.state_dict()[param_name].to("cpu") - merged_model.state_dict()[param_name].to("cpu")
         models_to_merge_task_vectors.append(task_vector_dict)
     
     sv_reduction = 1.0 / len(models_to_merge)
@@ -268,18 +291,27 @@ def iso_merging(merged_model: nn.Module, models_to_merge: list, exclude_param_na
         for index in range(1, len(models_to_merge_task_vectors)):
             merged_task_vector = merged_task_vector + models_to_merge_task_vectors[index]
     
+    num_models = len(models_to_merge)
     for param_name, param_value in merged_task_vector.task_vector_param_dict.items():
         original_dtype = param_value.dtype
-        param_value = param_value.cuda().to(torch.float32)
-        u, s, v = torch.linalg.svd(param_value, full_matrices=False)
-        avg_singular_value = torch.mean(s)
-        avg_s = torch.diag(torch.full_like(s, avg_singular_value))
         
-        merged_param = torch.linalg.multi_dot([
-            u, avg_s, v
-        ]).to(original_dtype).cpu()
-        
-        merged_task_vector.task_vector_param_dict[param_name] = merged_param
+        # [核心修复]: 只有 2D 矩阵才能进行 SVD 和 multi_dot
+        if len(param_value.shape) == 2:
+            param_value_gpu = param_value.cuda().to(torch.float32)
+            u, s, v = torch.linalg.svd(param_value_gpu, full_matrices=False)
+            avg_singular_value = torch.mean(s)
+            avg_s = torch.diag(torch.full_like(s, avg_singular_value))
+            
+            merged_param = torch.linalg.multi_dot([
+                u, avg_s, v
+            ]).to(original_dtype).cpu()
+            
+            merged_task_vector.task_vector_param_dict[param_name] = merged_param
+        else:
+            # 降级处理 (Fallback): 对于 1D 参数 (如 Bias, LayerNorm) 或 3D+ 参数
+            # 因为之前是在循环里累加了 num_models 次，所以这里除以模型数量，退化为平均值融合，防止偏置项数值爆炸
+            merged_task_vector.task_vector_param_dict[param_name] = (param_value / float(num_models)).to(original_dtype)
+
     merged_params = merged_task_vector.combine_with_pretrained_model(
         pretrained_model=merged_model,
         scaling_coefficient=scaling_coefficient
@@ -2127,12 +2159,14 @@ def wudi_nash_optmerging(merged_model: nn.Module, models_to_merge: list, exclude
 
     return merged_params
 
-def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, output_path=None):
+# ... (Keep all your other functions above exactly the same: TaskVector, ties_merging, wudi_merging, etc.) ...
+
+def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, output_path=None, base_path=None): # Added base_path parameter
     print(f"Start merging models using {merge_method}...")
     base_model = models['a']#.cuda()
     base_state_dict = base_model.state_dict()
     models_to_merge = []
-    for k in ['b', 'c', 'd', 'e', 'f']:
+    for k in ['b', 'c', 'd', 'e']:
         model = models[k]#.cuda()
         models_to_merge.append(model)
     
@@ -2144,7 +2178,16 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
         '.*bias.*'
     ]
     
-    if merge_method == "task_arithmetic":
+    # dispatch
+    if merge_method == "weight_average":
+        print("Running weight_average...")
+        merged_params = weight_average_merging(
+            merged_model=base_model,
+            models_to_merge=models_to_merge,
+            exclude_param_names_regex=exclude_param_names_regex,
+            scaling_coefficient=scaling_coefficient
+        )
+    elif merge_method == "task_arithmetic":
         print("Running task_arithmetic...")
         merged_params = task_arithmetic(
             merged_model=base_model,
@@ -2152,7 +2195,7 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient
         )
-    elif merge_method == "ties":
+    elif merge_method == "ties_merging":
         print("Running ties_merging...")
         merged_params = ties_merging(
             merged_model=base_model,
@@ -2161,50 +2204,7 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
             param_value_mask_rate=0.8,
             scaling_coefficient=scaling_coefficient
         )
-    elif merge_method == "dare ta":
-        print("Running Dare task_arithmetic...")
-        weight_mask_rates = [0.2 for _ in range(len(models_to_merge))]
-        with torch.no_grad():
-            new_models_to_merge = models_to_merge
-            for new_model_to_merge, weight_mask_rate in zip(new_models_to_merge, weight_mask_rates):
-                masked_param_dict = mask_model_weights(finetuned_model=new_model_to_merge, pretrained_model=base_model,
-                                                        exclude_param_names_regex=exclude_param_names_regex, weight_format="delta_weight",
-                                                        weight_mask_rate=weight_mask_rate, use_weight_rescale=True, mask_strategy="random")
-                copy_params_to_model(params=masked_param_dict, model=new_model_to_merge)
-        
-        merged_params = task_arithmetic(
-            merged_model=base_model,
-            models_to_merge=new_models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "dare ties":
-        print("Running Dare ties_merging...")
-        weight_mask_rates = [0.2 for _ in range(len(models_to_merge))]
-        with torch.no_grad():
-            new_models_to_merge = models_to_merge
-            for new_model_to_merge, weight_mask_rate in zip(new_models_to_merge, weight_mask_rates):
-                masked_param_dict = mask_model_weights(finetuned_model=new_model_to_merge, pretrained_model=base_model,
-                                                        exclude_param_names_regex=exclude_param_names_regex, weight_format="delta_weight",
-                                                        weight_mask_rate=weight_mask_rate, use_weight_rescale=True, mask_strategy="random")
-                copy_params_to_model(params=masked_param_dict, model=new_model_to_merge)
-        
-        merged_params = ties_merging(
-            merged_model=base_model,
-            models_to_merge=new_models_to_merge, 
-            exclude_param_names_regex=exclude_param_names_regex,
-            param_value_mask_rate=0.8,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "svd":
-        print("Running SVD_merging...")
-        merged_params = svd_merging(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "iso":
+    elif merge_method == "Iso-c":
         print("Running iso_merging...")
         merged_params = iso_merging(
             merged_model=base_model,
@@ -2212,7 +2212,7 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient
         )
-    elif merge_method == "wudi":
+    elif merge_method == "wudi_merging":
         print("Running wudi_merging...")
         merged_params = wudi_merging(
             merged_model=base_model,
@@ -2220,41 +2220,9 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient
         )
-    elif merge_method == "wudi2":
-        print("Running wudi v2...")
+    elif merge_method == "wudi_merging2":
+        print("Running wudi_merging2...")
         merged_params = wudi_merging2(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "wudi_nash":
-        print("Running wudi_nash_merging...")
-        merged_params = wudi_nash_merging(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "wudi_shapley_value":
-        print("Running wudi_shapley_value merging (Ablation: No Nash Optimization)...")
-        merged_params = wudi_shapley_value(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "wudi_only_nash":
-        print("Running wudi_only_nash merging (Ablation: No Shapley Weights)...")
-        merged_params = wudi_only_nash(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
-        )
-    elif merge_method == "shapfed_nash":
-        print("Running shapfed_nash_merging...")
-        merged_params = shapfed_nash_merging(
             merged_model=base_model,
             models_to_merge=models_to_merge,
             exclude_param_names_regex=exclude_param_names_regex,
@@ -2269,40 +2237,14 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
             scaling_coefficient=scaling_coefficient,
             lora_rank=16 # 建议为16，和文献对齐，你可以随意修改
         )
-    elif merge_method == "shapfed_core_nash":
-        print("Running shapfed_core_nash_merging...")
-        merged_params = shapfed_core_nash_merging(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient,
-            lora_rank=16
-        )
     elif merge_method == "wudi_only_core":
-        print("Running wudi_only_core_merging (Ablation: No Nash, No Shapley, Severe Rank Bottleneck)...")
+        print("Running wudi_only_core...")
         merged_params = wudi_only_core_merging(
             merged_model=base_model,
             models_to_merge=models_to_merge,
             exclude_param_names_regex=exclude_param_names_regex,
             scaling_coefficient=scaling_coefficient,
-            lora_rank=16
-        )
-    elif merge_method == "wudi_nash_lora_merging":
-        print("Running wudi_merge_lora_merging...")
-        merged_params = wudi_nash_lora_merging(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient,
-            lora_rank=16
-        )
-    elif merge_method == "wudi_nash_optmerging":
-        print("Running wudi_nash_optmerging...")
-        merged_params = wudi_nash_optmerging(
-            merged_model=base_model,
-            models_to_merge=models_to_merge,
-            exclude_param_names_regex=exclude_param_names_regex,
-            scaling_coefficient=scaling_coefficient
+            lora_rank=16 # 建议为16，和文献对齐，你可以随意修改
         )
     else:
         raise ValueError(f"Unknown merge_method: {merge_method}")
@@ -2311,14 +2253,45 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
         if key in base_state_dict:
             base_state_dict[key] = merged_params[key]
     base_model.load_state_dict(base_state_dict)
-    base_model = base_model.cuda()
+    # base_model = base_model.cuda()
 
     if output_path is None:
-        output_path = f'merged_model_{merge_method}' 
+        output_path = f"InternVL3_5-2B-merged_model_{merge_method}"
     print(f"Saving model to {output_path}")
     base_model.save_pretrained(output_path)
-    processor.save_pretrained(output_path)
     
+    # --- MODIFIED PROCESSOR SAVING LOGIC ---
+    try:
+        # Try to save the globally defined processor if it exists
+        if 'processor' in globals() and processor is not None:
+            processor.save_pretrained(output_path)
+            print("Processor saved successfully.")
+        else:
+             print("Processor object not found. Attempting to save tokenizer instead.")
+             # Fallback: Save tokenizer and copy processor files manually
+             tokenizer = AutoTokenizer.from_pretrained(base_path, trust_remote_code=True, use_fast=False)
+             tokenizer.save_pretrained(output_path)
+             import shutil
+             import glob
+             # Copy processing files manually if AutoProcessor fails
+             for file in glob.glob(os.path.join(base_path, "*process*")):
+                 shutil.copy(file, output_path)
+             print("Tokenizer and processing files copied manually.")
+    except Exception as e:
+        print(f"Warning: Could not save processor via AutoProcessor: {e}")
+        print("Attempting to fallback to basic tokenizer saving and file copying.")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(base_path, trust_remote_code=True, use_fast=False)
+            tokenizer.save_pretrained(output_path)
+            import shutil
+            import glob
+            for file in glob.glob(os.path.join(base_path, "*process*")):
+                 shutil.copy(file, output_path)
+            print("Fallback successful: Tokenizer and processing files copied.")
+        except Exception as fallback_e:
+            print(f"Fallback failed too: {fallback_e}")
+    # ----------------------------------------
+
     for model in models_to_merge:
         del model
     torch.cuda.empty_cache()
@@ -2326,41 +2299,59 @@ def merge_models(merge_method="wudi_core_nash", scaling_coefficient = 1.0, outpu
 
 #####################################################################
 if __name__ == "__main__":
-    path_a = 'Qwen/Qwen2-VL-7B'
-    path_b = 'yongxianwei/Qwen2-VL-7B-OCR'
-    path_c = 'yongxianwei/Qwen2-VL-7B-VQA'
-    path_d = 'yongxianwei/Qwen2-VL-7B-Geometry'
-    path_e = 'yongxianwei/Qwen2-VL-7B-Chart'
-    path_f = 'yongxianwei/Qwen2-VL-7B-Grounding'
+    path_a = "/root/Model_Merge/InternVL3.5-2B-Series/InternVL3_5-2B"
+    path_b = "/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_merged_model_chart"
+    path_c = "/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_merged_model_counting"
+    path_d = "/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_merged_model_general"
+    path_e = "/root/Model_Merge/InternVL3.5-2B-Series/InternVL35_2b_merged_model_ocr"
 
-    processor = AutoProcessor.from_pretrained(path_a, trust_remote_code=True)
+    # --- MODIFIED PROCESSOR LOADING LOGIC ---
+    processor = None
+    try:
+        # We try to load it, but if it fails with the start_image_token error, we catch it.
+        # We don't strictly need the processor object in memory just to merge weights.
+        processor = AutoProcessor.from_pretrained(path_a, trust_remote_code=True)
+    except AttributeError as e:
+        if "start_image_token" in str(e):
+            print("Caught known InternVL processor attribute error. Proceeding without loading AutoProcessor into memory.")
+            print("The merging script only needs the models. We will handle saving the tokenizer configuration later.")
+        else:
+            raise e # Reraise if it's a different AttributeError
+    except Exception as e:
+        print(f"Could not load processor: {e}. Proceeding anyway as merging only needs models.")
+    # ----------------------------------------
+
+    # Load models
     models = {
-        'a': Qwen2VLForConditionalGeneration.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'b': Qwen2VLForConditionalGeneration.from_pretrained(path_b, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'c': Qwen2VLForConditionalGeneration.from_pretrained(path_c, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'd': Qwen2VLForConditionalGeneration.from_pretrained(path_d, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'e': Qwen2VLForConditionalGeneration.from_pretrained(path_e, torch_dtype=torch.float16, trust_remote_code=True).eval(),
-        'f': Qwen2VLForConditionalGeneration.from_pretrained(path_f, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        "a": AutoModel.from_pretrained(path_a, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        "b": AutoModel.from_pretrained(path_b, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        "c": AutoModel.from_pretrained(path_c, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        "d": AutoModel.from_pretrained(path_d, torch_dtype=torch.float16, trust_remote_code=True).eval(),
+        "e": AutoModel.from_pretrained(path_e, torch_dtype=torch.float16, trust_remote_code=True).eval(),
     }
     
     original_base_state_dict = copy.deepcopy(models['a'].state_dict())
-    # scaling_coefficients = [0.1,0.3, 0.5, 0.7, 0.9, 1.5]
-    scaling_coefficients = [1.1,1.2,1.3,1.4]
-
-    merge_method = "wudi_core_nash"
-    for coeff in scaling_coefficients:
-        print(f"\n=======================================================")
-        print(f"Running experiment with scaling_coefficient={coeff}")
-        print(f"=======================================================\n")
-        
-        # Reset base model to original state
+    methods = [
+        # "weight_average",
+        # "task_arithmetic",
+        # "ties_merging",
+        # "Iso-c",
+        # "wudi_merging",
+        # "wudi_merging2",
+        # "wudi_core_nash",
+        "wudi_only_core"
+    ]
+    coeff = 1.0
+    for merge_method in methods:
+        print("\n=======================================================")
+        print(f"Running merging method: {merge_method} with scaling_coefficient={coeff}")
+        print("=======================================================\n")
         models['a'].load_state_dict(original_base_state_dict)
-        
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        output_dir = os.path.join(base_dir, f'merged_model_{merge_method}_coeff_{coeff}')
+        output_dir = os.path.join(base_dir, f'InternVL-3_5-2B-LoRA_merged_model_{merge_method}')
+        model = merge_models(merge_method=merge_method, scaling_coefficient=coeff, output_path=output_dir, base_path=path_a)
         
-        # Call merging
-        model = merge_models(merge_method=merge_method, scaling_coefficient=coeff, output_path=output_dir)
+        # ... (Keep your commented out examples unchanged) ...
 
         #####################################################################
         # Set example image paths
